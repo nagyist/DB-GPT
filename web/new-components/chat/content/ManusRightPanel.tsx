@@ -1,0 +1,977 @@
+import { CodePreview } from '@/components/chat/chat-content/code-preview';
+import markdownComponents, { markdownPlugins, preprocessLaTeX } from '@/components/chat/chat-content/config';
+import AdvancedChart, { createChartConfig } from '@/new-components/charts';
+import {
+  BarChartOutlined,
+  CheckCircleFilled,
+  CloseCircleFilled,
+  CodeOutlined,
+  ConsoleSqlOutlined,
+  DesktopOutlined,
+  DownOutlined,
+  EditOutlined,
+  ExportOutlined,
+  EyeOutlined,
+  FileExcelOutlined,
+  FileImageOutlined,
+  FileOutlined,
+  FilePptOutlined,
+  FileSearchOutlined,
+  FileTextOutlined,
+  FolderOpenOutlined,
+  LeftOutlined,
+  LoadingOutlined,
+  PlayCircleOutlined,
+  SearchOutlined,
+  SyncOutlined,
+  TableOutlined,
+  UpOutlined,
+} from '@ant-design/icons';
+import { GPTVis } from '@antv/gpt-vis';
+import { Button, Table, Tooltip, message } from 'antd';
+import classNames from 'classnames';
+import React, { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { ArtifactItem, StepStatus, StepType } from './ManusLeftPanel';
+
+/** Resolve image paths like `/images/xxx.png` to full backend URLs in dev mode */
+const resolveImageUrl = (src: string): string => {
+  if (!src) return src;
+  if (/^https?:\/\//.test(src)) return src;
+  if (src.startsWith('/images/')) {
+    const base = process.env.API_BASE_URL || '';
+    return base ? `${base}${src}` : src;
+  }
+  return src;
+};
+
+/** Replace `/images/...` references inside HTML content with full backend URLs */
+const resolveHtmlImageUrls = (html: string): string => {
+  const base = process.env.API_BASE_URL || '';
+  if (!base || !html) return html;
+  return html.replace(/(src\s*=\s*["'])\/images\//gi, `$1${base}/images/`);
+};
+
+export interface ExecutionOutput {
+  output_type: 'code' | 'text' | 'markdown' | 'table' | 'chart' | 'json' | 'error' | 'thought' | 'html' | 'image';
+  content: any;
+  timestamp?: number;
+}
+
+export interface ActiveStepInfo {
+  id: string;
+  type: StepType;
+  title: string;
+  subtitle?: string;
+  status: StepStatus;
+  detail?: string;
+}
+
+export interface ManusRightPanelProps {
+  activeStep?: ActiveStepInfo | null;
+  outputs: ExecutionOutput[];
+  isRunning?: boolean;
+  onRerun?: () => void;
+  terminalTitle?: string;
+  onCollapse?: () => void;
+  isCollapsed?: boolean;
+  artifacts?: ArtifactItem[];
+  onArtifactClick?: (artifact: ArtifactItem) => void;
+  /** Controlled panel view — when provided, overrides internal state */
+  panelView?: PanelView;
+  /** Callback when panel view changes (for lifting state) */
+  onPanelViewChange?: (view: PanelView) => void;
+  /** Artifact to preview in html-preview mode */
+  previewArtifact?: ArtifactItem | null;
+}
+
+export type PanelView = 'execution' | 'files' | 'html-preview';
+
+// Get icon for step type
+const getStepTypeIcon = (type: StepType) => {
+  switch (type) {
+    case 'read':
+      return <FileSearchOutlined className='text-emerald-500' />;
+    case 'edit':
+    case 'write':
+      return <EditOutlined className='text-amber-500' />;
+    case 'bash':
+      return <ConsoleSqlOutlined className='text-purple-500' />;
+    case 'grep':
+    case 'glob':
+      return <SearchOutlined className='text-cyan-500' />;
+    case 'python':
+      return <CodeOutlined className='text-blue-500' />;
+    case 'html':
+      return <CodeOutlined className='text-orange-500' />;
+    case 'task':
+    case 'skill':
+      return <PlayCircleOutlined className='text-indigo-500' />;
+    default:
+      return <FileTextOutlined className='text-gray-500' />;
+  }
+};
+
+// Get status badge
+const StatusBadge: React.FC<{ status: StepStatus }> = ({ status }) => {
+  switch (status) {
+    case 'running':
+      return (
+        <div className='flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400 text-[10px] font-medium'>
+          <LoadingOutlined spin className='text-xs' />
+          <span>运行中</span>
+        </div>
+      );
+    case 'completed':
+      return (
+        <div className='flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-900/50 text-emerald-600 dark:text-emerald-400 text-[10px] font-medium'>
+          <CheckCircleFilled className='text-xs' />
+          <span>完成</span>
+        </div>
+      );
+    case 'error':
+      return (
+        <div className='flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/50 text-red-600 dark:text-red-400 text-[10px] font-medium'>
+          <CloseCircleFilled className='text-xs' />
+          <span>错误</span>
+        </div>
+      );
+    default:
+      return (
+        <div className='flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 text-[10px] font-medium'>
+          <span>待执行</span>
+        </div>
+      );
+  }
+};
+
+// Copy to clipboard helper
+const copyToClipboard = (text: string) => {
+  navigator.clipboard.writeText(text);
+  message.success('已复制到剪贴板');
+};
+
+const getArtifactFileIcon = (artifact: ArtifactItem) => {
+  switch (artifact.type) {
+    case 'file': {
+      const ext = artifact.name.toLowerCase().split('.').pop() || '';
+      if (['xlsx', 'xls', 'csv'].includes(ext)) return <FileExcelOutlined className='text-green-600 text-lg' />;
+      if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext))
+        return <FileImageOutlined className='text-pink-500 text-lg' />;
+      if (['ppt', 'pptx'].includes(ext)) return <FilePptOutlined className='text-orange-500 text-lg' />;
+      return <FileTextOutlined className='text-blue-500 text-lg' />;
+    }
+    case 'html':
+      return <DesktopOutlined className='text-blue-500 text-lg' />;
+    case 'table':
+      return <TableOutlined className='text-blue-500 text-lg' />;
+    case 'chart':
+      return <BarChartOutlined className='text-green-500 text-lg' />;
+    case 'image':
+      return <FileImageOutlined className='text-pink-500 text-lg' />;
+    case 'code':
+      return <CodeOutlined className='text-purple-500 text-lg' />;
+    case 'markdown':
+      return <FileTextOutlined className='text-orange-500 text-lg' />;
+    case 'summary':
+      return <FileTextOutlined className='text-emerald-500 text-lg' />;
+    default:
+      return <FileOutlined className='text-gray-500 text-lg' />;
+  }
+};
+
+const getArtifactFileBg = (type: string): string => {
+  const map: Record<string, string> = {
+    file: 'bg-gray-50 dark:bg-gray-800',
+    html: 'bg-blue-50 dark:bg-blue-900/20',
+    table: 'bg-blue-50 dark:bg-blue-900/20',
+    chart: 'bg-green-50 dark:bg-green-900/20',
+    image: 'bg-pink-50 dark:bg-pink-900/20',
+    code: 'bg-purple-50 dark:bg-purple-900/20',
+    markdown: 'bg-orange-50 dark:bg-orange-900/20',
+    summary: 'bg-emerald-50 dark:bg-emerald-900/20',
+  };
+  return map[type] || 'bg-gray-50 dark:bg-gray-800';
+};
+
+const getArtifactTypeLabel = (type: string): string => {
+  const map: Record<string, string> = {
+    file: '文件',
+    html: '网页报告',
+    table: '数据表',
+    chart: '图表',
+    image: '图片',
+    code: '代码',
+    markdown: '文档',
+    summary: '分析总结',
+  };
+  return map[type] || '产物';
+};
+
+type FileFilterTab = 'all' | 'document' | 'image' | 'code' | 'link';
+
+const FILE_FILTER_TABS: { key: FileFilterTab; label: string }[] = [
+  { key: 'all', label: '全部' },
+  { key: 'document', label: '文档' },
+  { key: 'image', label: '图片' },
+  { key: 'code', label: '代码文件' },
+  { key: 'link', label: '链接' },
+];
+
+const getFileFilterCategory = (artifact: ArtifactItem): FileFilterTab[] => {
+  const categories: FileFilterTab[] = ['all'];
+  const ext = artifact.name.toLowerCase().split('.').pop() || '';
+  if (artifact.type === 'image' || ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext)) {
+    categories.push('image');
+  }
+  if (artifact.type === 'code' || ['py', 'js', 'ts', 'tsx', 'jsx', 'sql', 'sh', 'json', 'yaml', 'yml'].includes(ext)) {
+    categories.push('code');
+  }
+  if (
+    artifact.type === 'html' ||
+    artifact.type === 'markdown' ||
+    artifact.type === 'summary' ||
+    artifact.type === 'table' ||
+    ['xlsx', 'xls', 'csv', 'doc', 'docx', 'pdf', 'ppt', 'pptx', 'md', 'txt', 'html', 'htm'].includes(ext)
+  ) {
+    categories.push('document');
+  }
+  if (artifact.type === 'file' && categories.length === 1) {
+    categories.push('document');
+  }
+  return categories;
+};
+
+const formatArtifactDate = (timestamp: number): string => {
+  const now = new Date();
+  const date = new Date(timestamp);
+  const diffMs = now.getTime() - date.getTime();
+  const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+
+  if (diffDays === 0) return '今天';
+  if (diffDays === 1) return '昨天';
+  if (diffDays < 7) {
+    const dayNames = ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六'];
+    return dayNames[date.getDay()];
+  }
+  return `${date.getMonth() + 1}月${date.getDate()}日`;
+};
+
+const FileListItem: React.FC<{ artifact: ArtifactItem; onClick?: () => void }> = memo(({ artifact, onClick }) => {
+  const isImage = artifact.type === 'image' || /\.(png|jpg|jpeg|gif|webp|svg)$/i.test(artifact.name);
+  const imgSrc = isImage && typeof artifact.content === 'string' ? resolveImageUrl(artifact.content) : null;
+
+  return (
+    <div
+      onClick={onClick}
+      className='flex items-center gap-3 px-4 py-3.5 cursor-pointer hover:bg-gray-50 dark:hover:bg-[#1f2025] transition-colors border-b border-gray-100 dark:border-gray-800 last:border-b-0'
+    >
+      {imgSrc ? (
+        <img
+          src={imgSrc}
+          alt={artifact.name}
+          className='w-10 h-10 rounded-lg object-cover flex-shrink-0 border border-gray-200 dark:border-gray-700'
+        />
+      ) : (
+        <div
+          className={classNames(
+            'w-10 h-10 rounded-lg flex items-center justify-center flex-shrink-0',
+            getArtifactFileBg(artifact.type),
+          )}
+        >
+          {getArtifactFileIcon(artifact)}
+        </div>
+      )}
+      <div className='min-w-0 flex-1'>
+        <div className='text-sm font-medium text-gray-800 dark:text-gray-200 truncate'>{artifact.name}</div>
+        <div className='text-[11px] text-gray-400 dark:text-gray-500 flex items-center gap-1.5 mt-0.5'>
+          <span>{getArtifactTypeLabel(artifact.type)}</span>
+          {artifact.size != null && (
+            <>
+              <span className='text-gray-300 dark:text-gray-600'>·</span>
+              <span>
+                {artifact.size < 1024
+                  ? artifact.size + ' B'
+                  : artifact.size < 1024 * 1024
+                    ? (artifact.size / 1024).toFixed(1) + ' KB'
+                    : (artifact.size / (1024 * 1024)).toFixed(1) + ' MB'}
+              </span>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+});
+
+FileListItem.displayName = 'FileListItem';
+
+// Output Renderer Component
+const OutputRenderer: React.FC<{ output: ExecutionOutput; index: number }> = memo(({ output, index }) => {
+  const content = output.content;
+
+  if (output.output_type === 'thought') {
+    return null; // Don't render thoughts
+  }
+
+  return (
+    <>
+      {output.output_type === 'code' && (
+        <CodePreview
+          code={String(content)}
+          language='python'
+          customStyle={{ background: '#0f172a', margin: 0, borderRadius: 8 }}
+        />
+      )}
+
+      {output.output_type === 'error' && (
+        <div className='rounded-lg bg-red-50 dark:bg-red-900/20 px-4 py-3 text-sm text-red-600 dark:text-red-400 font-mono whitespace-pre-wrap'>
+          {String(content)}
+        </div>
+      )}
+
+      {output.output_type === 'text' && (
+        <div className='rounded-lg bg-gray-900 px-4 py-3 text-sm text-green-400 font-mono whitespace-pre-wrap leading-relaxed overflow-x-auto'>
+          {String(content)}
+        </div>
+      )}
+
+      {output.output_type === 'markdown' && (
+        <div className='prose prose-sm dark:prose-invert max-w-none'>
+          <GPTVis components={markdownComponents} {...markdownPlugins}>
+            {preprocessLaTeX(String(content))}
+          </GPTVis>
+        </div>
+      )}
+
+      {output.output_type === 'table' && (
+        <Table
+          size='small'
+          pagination={{ pageSize: 10, showSizeChanger: true }}
+          columns={(content?.columns || []).map((col: string | { title: string; dataIndex: string }) =>
+            typeof col === 'string' ? { title: col, dataIndex: col, key: col, ellipsis: true } : col,
+          )}
+          dataSource={content?.rows || []}
+          rowKey={(row, idx) => String(row?.id ?? idx)}
+          scroll={{ x: 'max-content' }}
+          className='border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden'
+        />
+      )}
+
+      {output.output_type === 'chart' && (
+        <div className='h-72'>
+          <AdvancedChart
+            config={createChartConfig(content?.data || [], {
+              chartType: content?.chartType || 'line',
+              xField: content?.xField || 'x',
+              yField: content?.yField || 'y',
+              seriesField: content?.seriesField,
+              title: content?.title,
+              smooth: true,
+              height: 280,
+            })}
+          />
+        </div>
+      )}
+
+      {output.output_type === 'json' && (
+        <CodePreview
+          code={typeof content === 'string' ? content : JSON.stringify(content, null, 2)}
+          language='json'
+          customStyle={{ background: '#0f172a', margin: 0, borderRadius: 8 }}
+        />
+      )}
+
+      {output.output_type === 'html' && (
+        <div className='rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700'>
+          {content?.title && (
+            <div className='px-4 py-2 bg-gray-50 dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 flex items-center gap-2'>
+              <FileTextOutlined className='text-blue-500 text-xs' />
+              <span className='text-xs font-medium text-gray-600 dark:text-gray-300'>{content.title}</span>
+            </div>
+          )}
+          <iframe
+            srcDoc={resolveHtmlImageUrls(
+              typeof content === 'string' ? content : content?.html || content?.content || String(content),
+            )}
+            sandbox='allow-scripts allow-same-origin'
+            className='w-full bg-white'
+            style={{ border: 'none', minHeight: 500 }}
+            onLoad={e => {
+              // Auto-resize iframe to content height
+              try {
+                const iframe = e.target as HTMLIFrameElement;
+                const doc = iframe.contentDocument || iframe.contentWindow?.document;
+                if (doc?.body) {
+                  const height = Math.max(doc.body.scrollHeight, 500);
+                  iframe.style.height = `${Math.min(height, 1200)}px`;
+                }
+              } catch {
+                // Cross-origin restriction — keep default height
+              }
+            }}
+          />
+        </div>
+      )}
+
+      {output.output_type === 'image' && (
+        <div className='rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900'>
+          <img
+            src={resolveImageUrl(
+              typeof content === 'string' ? content : content?.url || content?.src || String(content),
+            )}
+            alt='Generated chart'
+            className='w-full h-auto object-contain'
+            style={{ maxHeight: 600 }}
+          />
+        </div>
+      )}
+    </>
+  );
+});
+
+OutputRenderer.displayName = 'OutputRenderer';
+
+const HtmlTabbedRenderer: React.FC<{ code?: ExecutionOutput; html: ExecutionOutput }> = memo(({ code, html }) => {
+  const [activeTab, setActiveTab] = useState<'preview' | 'source'>('preview');
+  const htmlContent = html.content;
+  const rawHtml =
+    typeof htmlContent === 'string' ? htmlContent : htmlContent?.html || htmlContent?.content || String(htmlContent);
+  const htmlString = resolveHtmlImageUrls(rawHtml);
+  const sourceCode = code ? String(code.content) : rawHtml;
+
+  return (
+    <div className='rounded-xl overflow-hidden border border-gray-200 dark:border-gray-700'>
+      <div className='flex items-center gap-0 bg-white dark:bg-[#111217] border-b border-gray-200 dark:border-gray-700'>
+        <button
+          onClick={() => setActiveTab('preview')}
+          className={classNames(
+            'px-4 py-2 text-xs font-medium transition-colors relative',
+            activeTab === 'preview'
+              ? 'text-gray-900 dark:text-gray-100'
+              : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300',
+          )}
+        >
+          <EyeOutlined className='mr-1.5' />
+          渲染结果
+          {activeTab === 'preview' && (
+            <div className='absolute bottom-0 left-0 right-0 h-[2px] bg-gray-900 dark:bg-gray-100 rounded-full' />
+          )}
+        </button>
+        <button
+          onClick={() => setActiveTab('source')}
+          className={classNames(
+            'px-4 py-2 text-xs font-medium transition-colors relative',
+            activeTab === 'source'
+              ? 'text-gray-900 dark:text-gray-100'
+              : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300',
+          )}
+        >
+          <CodeOutlined className='mr-1.5' />
+          源代码
+          {activeTab === 'source' && (
+            <div className='absolute bottom-0 left-0 right-0 h-[2px] bg-gray-900 dark:bg-gray-100 rounded-full' />
+          )}
+        </button>
+      </div>
+
+      {activeTab === 'preview' ? (
+        <div>
+          {htmlContent?.title && (
+            <div className='px-4 py-2 bg-gray-50 dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 flex items-center gap-2'>
+              <FileTextOutlined className='text-blue-500 text-xs' />
+              <span className='text-xs font-medium text-gray-600 dark:text-gray-300'>{htmlContent.title}</span>
+            </div>
+          )}
+          <iframe
+            srcDoc={htmlString}
+            sandbox='allow-scripts allow-same-origin'
+            className='w-full bg-white'
+            style={{ border: 'none', minHeight: 500 }}
+            onLoad={e => {
+              try {
+                const iframe = e.target as HTMLIFrameElement;
+                const doc = iframe.contentDocument || iframe.contentWindow?.document;
+                if (doc?.body) {
+                  const height = Math.max(doc.body.scrollHeight, 500);
+                  iframe.style.height = `${Math.min(height, 1200)}px`;
+                }
+              } catch {
+                // Cross-origin restriction
+              }
+            }}
+          />
+        </div>
+      ) : (
+        <CodePreview
+          code={sourceCode}
+          language='html'
+          customStyle={{ background: '#0f172a', margin: 0, borderRadius: 0 }}
+        />
+      )}
+    </div>
+  );
+});
+
+HtmlTabbedRenderer.displayName = 'HtmlTabbedRenderer';
+
+// Main Component
+const ManusRightPanel: React.FC<ManusRightPanelProps> = ({
+  activeStep,
+  outputs,
+  isRunning,
+  onRerun,
+  terminalTitle = 'AI 的电脑',
+  onCollapse,
+  artifacts,
+  onArtifactClick,
+  panelView: controlledPanelView,
+  onPanelViewChange,
+  previewArtifact,
+}) => {
+  const [inputCollapsed, setInputCollapsed] = useState(false);
+  const [internalPanelView, setInternalPanelView] = useState<PanelView>('execution');
+  const [fileFilter, setFileFilter] = useState<FileFilterTab>('all');
+  const htmlPreviewRef = useRef<HTMLIFrameElement>(null);
+  const panelView = controlledPanelView ?? internalPanelView;
+  const setPanelView = (view: PanelView) => {
+    setInternalPanelView(view);
+    onPanelViewChange?.(view);
+  };
+
+  const handleExportPdf = () => {
+    try {
+      const iframe = htmlPreviewRef.current;
+      if (iframe?.contentWindow) {
+        iframe.contentWindow.focus();
+        iframe.contentWindow.print();
+        return;
+      }
+    } catch {
+      /* fallback below */
+    }
+    if (previewArtifact) {
+      const htmlStr =
+        typeof previewArtifact.content === 'string'
+          ? previewArtifact.content
+          : previewArtifact.content?.html || previewArtifact.content?.content || String(previewArtifact.content);
+      const win = window.open('', '_blank');
+      if (win) {
+        win.document.write(resolveHtmlImageUrls(htmlStr));
+        win.document.close();
+        win.focus();
+        win.print();
+      } else {
+        message.error('浏览器阻止了弹出窗口，请允许后重试');
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (controlledPanelView !== undefined) {
+      setInternalPanelView(controlledPanelView);
+    }
+  }, [controlledPanelView]);
+  const visibleOutputs = useMemo(() => outputs.filter(o => o.output_type !== 'thought'), [outputs]);
+
+  const filteredArtifacts = useMemo(() => {
+    if (!artifacts) return [];
+    if (fileFilter === 'all') return artifacts;
+    return artifacts.filter(a => getFileFilterCategory(a).includes(fileFilter));
+  }, [artifacts, fileFilter]);
+
+  const dateGroupedArtifacts = useMemo(() => {
+    const groups: { label: string; items: ArtifactItem[] }[] = [];
+    const groupMap = new Map<string, ArtifactItem[]>();
+    for (const a of filteredArtifacts) {
+      const label = formatArtifactDate(a.createdAt);
+      if (!groupMap.has(label)) groupMap.set(label, []);
+      groupMap.get(label)!.push(a);
+    }
+    groupMap.forEach((items, label) => groups.push({ label, items }));
+    return groups;
+  }, [filteredArtifacts]);
+
+  // Group consecutive code+text pairs into notebook-cell units,
+  // and code+html pairs into tabbed views (渲染结果 / 源代码)
+  const outputGroups = useMemo(() => {
+    const groups: Array<
+      | { type: 'code-execution'; codes: ExecutionOutput[]; results: ExecutionOutput[] }
+      | { type: 'html-tabbed'; code?: ExecutionOutput; html: ExecutionOutput }
+      | { type: 'single'; output: ExecutionOutput }
+    > = [];
+    let i = 0;
+    while (i < visibleOutputs.length) {
+      if (visibleOutputs[i].output_type === 'code') {
+        const codes: ExecutionOutput[] = [visibleOutputs[i]];
+        i += 1;
+        while (i < visibleOutputs.length && visibleOutputs[i].output_type === 'code') {
+          codes.push(visibleOutputs[i]);
+          i += 1;
+        }
+        if (i < visibleOutputs.length && visibleOutputs[i].output_type === 'html') {
+          groups.push({
+            type: 'html-tabbed',
+            code: { ...codes[0], content: codes.map(c => String(c.content)).join('\n') },
+            html: visibleOutputs[i],
+          });
+          i += 1;
+        } else {
+          const results: ExecutionOutput[] = [];
+          while (i < visibleOutputs.length && visibleOutputs[i].output_type === 'text') {
+            results.push(visibleOutputs[i]);
+            i += 1;
+          }
+          groups.push({ type: 'code-execution', codes, results });
+        }
+      } else if (visibleOutputs[i].output_type === 'html') {
+        groups.push({ type: 'html-tabbed', html: visibleOutputs[i] });
+        i += 1;
+      } else {
+        groups.push({ type: 'single', output: visibleOutputs[i] });
+        i += 1;
+      }
+    }
+    return groups;
+  }, [visibleOutputs]);
+
+  return (
+    <div className='relative flex flex-col h-full bg-[#f8f9fc] dark:bg-[#0d0e11]'>
+      {onCollapse && (
+        <Tooltip title='收起面板' placement='left'>
+          <button
+            onClick={() => onCollapse()}
+            className='absolute left-0 top-1/2 -translate-y-1/2 -translate-x-1/2 z-10 w-6 h-12 flex items-center justify-center bg-white dark:bg-[#1a1b1e] border border-gray-200 dark:border-gray-700 rounded-full shadow-sm hover:bg-gray-50 dark:hover:bg-gray-800 hover:shadow-md transition-all text-gray-400 hover:text-gray-600 dark:hover:text-gray-300'
+          >
+            <LeftOutlined style={{ fontSize: 10 }} />
+          </button>
+        </Tooltip>
+      )}
+
+      {/* Terminal Header */}
+      <div className='flex items-center justify-between px-5 py-3 bg-white dark:bg-[#111217] border-b border-gray-200 dark:border-gray-800'>
+        <div className='flex items-center gap-3'>
+          <div className='flex items-center gap-2'>
+            <div className='w-3 h-3 rounded-full bg-red-500' />
+            <div className='w-3 h-3 rounded-full bg-yellow-500' />
+            <div className='w-3 h-3 rounded-full bg-green-500' />
+          </div>
+          <div className='flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300 font-medium'>
+            <DesktopOutlined className='text-gray-500' />
+            <span>{terminalTitle}</span>
+            {isRunning && <LoadingOutlined spin className='text-blue-500 ml-1' />}
+          </div>
+        </div>
+
+        <div className='flex items-center gap-1'>
+          {panelView === 'html-preview' && previewArtifact && (
+            <Tooltip title='导出 PDF'>
+              <Button
+                type='text'
+                size='small'
+                icon={<ExportOutlined />}
+                onClick={handleExportPdf}
+                className='text-gray-500 hover:text-blue-500'
+              >
+                导出 PDF
+              </Button>
+            </Tooltip>
+          )}
+
+          {activeStep && onRerun && activeStep.status === 'completed' && (
+            <Tooltip title='重新执行'>
+              <Button
+                type='text'
+                size='small'
+                icon={<SyncOutlined />}
+                onClick={onRerun}
+                className='text-gray-500 hover:text-blue-500'
+              >
+                重新执行
+              </Button>
+            </Tooltip>
+          )}
+
+        </div>
+      </div>
+
+      {/* View Toggle Tabs */}
+      {((artifacts && artifacts.length > 0) || previewArtifact) && (
+        <div className='flex items-center gap-0 px-5 bg-white dark:bg-[#111217] border-b border-gray-200 dark:border-gray-800'>
+          <button
+            onClick={() => setPanelView('execution')}
+            className={classNames(
+              'px-4 py-2.5 text-xs font-medium transition-colors relative',
+              panelView === 'execution'
+                ? 'text-gray-900 dark:text-gray-100'
+                : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300',
+            )}
+          >
+            <DesktopOutlined className='mr-1.5' />
+            执行过程
+            {panelView === 'execution' && (
+              <div className='absolute bottom-0 left-0 right-0 h-[2px] bg-gray-900 dark:bg-gray-100 rounded-full' />
+            )}
+          </button>
+          {artifacts && artifacts.length > 0 && (
+            <button
+              onClick={() => setPanelView('files')}
+              className={classNames(
+                'px-4 py-2.5 text-xs font-medium transition-colors relative',
+                panelView === 'files'
+                  ? 'text-gray-900 dark:text-gray-100'
+                  : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300',
+              )}
+            >
+              <FolderOpenOutlined className='mr-1.5' />
+              任务文件
+              <span className='ml-1.5 text-[10px] bg-gray-100 dark:bg-gray-800 text-gray-500 px-1.5 py-0.5 rounded-full'>
+                {artifacts.length}
+              </span>
+              {panelView === 'files' && (
+                <div className='absolute bottom-0 left-0 right-0 h-[2px] bg-gray-900 dark:bg-gray-100 rounded-full' />
+              )}
+            </button>
+          )}
+          {previewArtifact && (
+            <button
+              onClick={() => setPanelView('html-preview')}
+              className={classNames(
+                'px-4 py-2.5 text-xs font-medium transition-colors relative',
+                panelView === 'html-preview'
+                  ? 'text-gray-900 dark:text-gray-100'
+                  : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300',
+              )}
+            >
+              <EyeOutlined className='mr-1.5' />
+              {previewArtifact.name || '网页预览'}
+              {panelView === 'html-preview' && (
+                <div className='absolute bottom-0 left-0 right-0 h-[2px] bg-gray-900 dark:bg-gray-100 rounded-full' />
+              )}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Content Area */}
+      <div className={classNames('flex-1 overflow-y-auto', panelView === 'html-preview' ? 'p-0' : 'p-5 space-y-4')}>
+        {panelView === 'html-preview' && previewArtifact ? (
+          <div className='w-full h-full flex flex-col'>
+            <iframe
+              ref={htmlPreviewRef}
+              srcDoc={resolveHtmlImageUrls(
+                typeof previewArtifact.content === 'string'
+                  ? previewArtifact.content
+                  : previewArtifact.content?.html ||
+                      previewArtifact.content?.content ||
+                      String(previewArtifact.content),
+              )}
+              sandbox='allow-scripts allow-same-origin allow-modals'
+              className='w-full flex-1 bg-white'
+              style={{ border: 'none', minHeight: 600 }}
+            />
+          </div>
+        ) : panelView === 'files' ? (
+          <div className='space-y-0'>
+            <div className='flex items-center gap-1 mb-4 bg-gray-100/80 dark:bg-gray-800/60 rounded-lg p-1'>
+              {FILE_FILTER_TABS.map(tab => {
+                const count =
+                  tab.key === 'all'
+                    ? artifacts?.length || 0
+                    : (artifacts || []).filter(a => getFileFilterCategory(a).includes(tab.key)).length;
+                if (tab.key !== 'all' && count === 0) return null;
+                return (
+                  <button
+                    key={tab.key}
+                    onClick={() => setFileFilter(tab.key)}
+                    className={classNames(
+                      'px-3 py-1.5 text-xs font-medium rounded-md transition-all',
+                      fileFilter === tab.key
+                        ? 'bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
+                        : 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300',
+                    )}
+                  >
+                    {tab.label}
+                    {tab.key === 'all' && count > 0 && <span className='ml-1 text-[10px] text-gray-400'>{count}</span>}
+                  </button>
+                );
+              })}
+            </div>
+
+            {dateGroupedArtifacts.length > 0 ? (
+              dateGroupedArtifacts.map(group => (
+                <div key={group.label}>
+                  <div className='px-1 py-2 text-[11px] font-medium text-gray-400 dark:text-gray-500 uppercase tracking-wider'>
+                    {group.label}
+                  </div>
+                  <div className='rounded-xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-[#1a1b1e] overflow-hidden mb-3'>
+                    {group.items.map(artifact => (
+                      <FileListItem key={artifact.id} artifact={artifact} onClick={() => onArtifactClick?.(artifact)} />
+                    ))}
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div className='flex flex-col items-center justify-center py-16 text-gray-400'>
+                <FolderOpenOutlined className='text-3xl mb-4' />
+                <span className='text-sm'>暂无文件</span>
+              </div>
+            )}
+          </div>
+        ) : activeStep ? (
+          <div className='rounded-xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-[#1a1b1e] overflow-hidden'>
+            {activeStep.type === 'python' || activeStep.type === 'html' ? (
+              <div className='flex items-center justify-between px-4 py-3'>
+                <div className='flex items-center gap-3 min-w-0 flex-1'>
+                  <div
+                    className={classNames(
+                      'w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0',
+                      activeStep.type === 'html'
+                        ? 'bg-orange-50 dark:bg-orange-900/30'
+                        : 'bg-blue-50 dark:bg-blue-900/30',
+                    )}
+                  >
+                    {getStepTypeIcon(activeStep.type)}
+                  </div>
+                  <div className='text-sm font-semibold text-gray-800 dark:text-gray-200 truncate'>
+                    {activeStep.title}
+                  </div>
+                </div>
+                <div className='flex items-center gap-2 flex-shrink-0'>
+                  <StatusBadge status={activeStep.status} />
+                </div>
+              </div>
+            ) : (
+              <>
+                <div
+                  className='flex items-center justify-between px-4 py-3 cursor-pointer select-none hover:bg-gray-50 dark:hover:bg-[#1f2025] transition-colors'
+                  onClick={() => setInputCollapsed(prev => !prev)}
+                >
+                  <div className='flex items-center gap-3 min-w-0 flex-1'>
+                    <div
+                      className={classNames('w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0', {
+                        'bg-emerald-50 dark:bg-emerald-900/30': activeStep.type === 'read',
+                        'bg-amber-50 dark:bg-amber-900/30': activeStep.type === 'edit' || activeStep.type === 'write',
+                        'bg-purple-50 dark:bg-purple-900/30': activeStep.type === 'bash',
+                        'bg-cyan-50 dark:bg-cyan-900/30': activeStep.type === 'grep' || activeStep.type === 'glob',
+                        'bg-blue-50 dark:bg-blue-900/30': activeStep.type === 'python',
+                        'bg-orange-50 dark:bg-orange-900/30': activeStep.type === 'html',
+                        'bg-indigo-50 dark:bg-indigo-900/30': activeStep.type === 'task' || activeStep.type === 'skill',
+                        'bg-gray-50 dark:bg-gray-800': activeStep.type === 'other',
+                      })}
+                    >
+                      {getStepTypeIcon(activeStep.type)}
+                    </div>
+                    <div className='text-sm font-semibold text-gray-800 dark:text-gray-200 truncate'>
+                      {activeStep.title}
+                    </div>
+                  </div>
+                  <div className='flex items-center gap-2 flex-shrink-0'>
+                    <StatusBadge status={activeStep.status} />
+                    <span className='text-gray-400 text-xs transition-transform duration-200'>
+                      {inputCollapsed ? <DownOutlined /> : <UpOutlined />}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Expanded detail */}
+                {!inputCollapsed && activeStep.detail && (
+                  <div className='px-4 pb-3'>
+                    <div className='text-xs text-gray-500 dark:text-gray-400 font-mono whitespace-pre-wrap bg-gray-50 dark:bg-[#161719] rounded-lg px-3 py-2'>
+                      {activeStep.detail}
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+
+            {/* Divider + Outputs */}
+            {visibleOutputs.length > 0 && (
+              <>
+                <div className='border-t border-gray-100 dark:border-gray-800' />
+                <div className='p-4 space-y-3'>
+                  {outputGroups.map((group, gIdx) =>
+                    group.type === 'code-execution' ? (
+                      <div key={`group-${gIdx}`} className='rounded-xl overflow-hidden border border-gray-700/50'>
+                        <div className='relative'>
+                          <span className='absolute top-2 right-2 z-10 text-[10px] text-gray-400 bg-gray-800/80 px-2 py-0.5 rounded'>
+                            代码
+                          </span>
+                          <CodePreview
+                            code={group.codes.map(c => String(c.content)).join('\n')}
+                            language='python'
+                            customStyle={{ background: '#0f172a', margin: 0, borderRadius: 0 }}
+                          />
+                        </div>
+                        {group.results.length > 0 && (
+                          <>
+                            <div className='border-t border-gray-700/50' />
+                            <div className='relative bg-gray-900'>
+                              <span className='absolute top-2 right-2 z-10 text-[10px] text-gray-400 bg-gray-800/80 px-2 py-0.5 rounded'>
+                                执行结果
+                              </span>
+                              <div className='px-4 py-3 text-sm text-green-400 font-mono whitespace-pre-wrap leading-relaxed overflow-x-auto'>
+                                {group.results.map(r => String(r.content)).join('\n')}
+                              </div>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    ) : group.type === 'html-tabbed' ? (
+                      <HtmlTabbedRenderer key={`html-tabbed-${gIdx}`} code={group.code} html={group.html} />
+                    ) : (
+                      <OutputRenderer key={`output-${gIdx}`} output={group.output} index={gIdx} />
+                    ),
+                  )}
+                </div>
+              </>
+            )}
+
+            {/* Running / Empty output states */}
+            {visibleOutputs.length === 0 && (
+              <>
+                <div className='border-t border-gray-100 dark:border-gray-800' />
+                {isRunning ? (
+                  <div className='flex flex-col items-center justify-center py-12 text-gray-400'>
+                    <LoadingOutlined className='text-3xl text-blue-500 mb-4' />
+                    <span className='text-sm'>正在执行...</span>
+                    <span className='text-xs text-gray-500 mt-1'>请稍候，结果即将显示</span>
+                  </div>
+                ) : (
+                  <div className='flex flex-col items-center justify-center py-12 text-gray-400'>
+                    <FileTextOutlined className='text-3xl mb-4' />
+                    <span className='text-sm'>暂无输出结果</span>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        ) : (
+          // Empty State
+          <div className='flex flex-col items-center justify-center h-full py-20 text-gray-400'>
+            <div className='w-20 h-20 rounded-2xl bg-gray-100 dark:bg-gray-800 flex items-center justify-center mb-4'>
+              <ConsoleSqlOutlined className='text-3xl text-gray-400' />
+            </div>
+            <span className='text-sm font-medium mb-1'>选择一个步骤查看详情</span>
+            <span className='text-xs text-gray-500'>点击左侧的步骤卡片以显示执行结果</span>
+          </div>
+        )}
+      </div>
+
+      {/* Footer Status Bar */}
+      <div className='px-5 py-2 border-t border-gray-200 dark:border-gray-800 bg-white dark:bg-[#111217]'>
+        <div className='flex items-center justify-between text-[10px] text-gray-400'>
+          <div className='flex items-center gap-4'>
+            <span className='flex items-center gap-1'>
+              <span className={`w-2 h-2 rounded-full ${isRunning ? 'bg-blue-500 animate-pulse' : 'bg-emerald-500'}`} />
+              {isRunning ? '执行中' : '就绪'}
+            </span>
+            {visibleOutputs.length > 0 && <span>{visibleOutputs.length} 个输出</span>}
+          </div>
+          {activeStep && <span>Step ID: {activeStep.id}</span>}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default memo(ManusRightPanel);
